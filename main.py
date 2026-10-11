@@ -384,3 +384,157 @@ if __name__ == "__main__":
             f"{k:10s} params={i['params']:>9,}  epochs={i['epochs_run']:>2}  time={i['train_time_s']:7.1f}s  "
             f"test_loss={t['loss']:.3f}  ppl={t['perplexity']:7.1f}  top1={t['top1']:.3f}  top5={t['top5']:.3f}"
         )
+
+# =====================================================================================
+# Metrics: test loss, perplexity, top-1 / top-5 accuracy, training time, parameters,
+#          convergence (epochs, curves) and over-fitting gap (validation - training loss).
+
+
+def load_trained():
+    """If chunk 3 did not run in this process, reload weights and results saved by an earlier run."""
+    global models, histories, test_results, run_info
+    if models and test_results:
+        return
+    path = f"{OUT}/training_results.json"
+    if not os.path.exists(path):
+        raise SystemExit(
+            "Run the training first (chunk 3): outputs/training_results.json not found."
+        )
+    saved = json.load(open(path))
+    histories, test_results, run_info = saved["histories"], saved["test"], saved["info"]
+    for kind in KINDS:
+        m = build_model(kind)
+        m.load_state_dict(torch.load(f"{OUT}/models/{kind}.pt", map_location=DEVICE))
+        m.eval()
+        models[kind] = m
+
+
+load_trained()
+
+
+rows = []
+for kind in KINDS:
+    t, i, h = test_results[kind], run_info[kind], histories[kind]
+    rows.append(
+        {
+            "Model": kind,
+            "Parameters": i["params"],
+            "Epochs run": i["epochs_run"],
+            "Train time (s)": round(i["train_time_s"], 1),
+            "Sec/epoch": round(i["train_time_s"] / i["epochs_run"], 1),
+            "Final train loss": round(h["train_loss"][-1], 3),
+            "Best val loss": round(i["best_val_loss"], 3),
+            "Test loss": round(t["loss"], 3),
+            "Test perplexity": round(t["perplexity"], 1),
+            "Top-1 acc": round(t["top1"], 4),
+            "Top-5 acc": round(t["top5"], 4),
+            # over-fitting gap at the best epoch: validation loss minus training loss of that epoch
+            "Val-train gap": round(
+                i["best_val_loss"] - h["train_loss"][int(np.argmin(h["val_loss"]))], 3
+            ),
+        }
+    )
+results_df = pd.DataFrame(rows)
+results_df.to_csv(f"{OUT}/results.csv", index=False)
+
+
+def df_to_markdown(df):
+    head = "| " + " | ".join(df.columns) + " |\n|" + "---|" * len(df.columns) + "\n"
+    body = "\n".join(
+        "| " + " | ".join(str(v) for v in r) + " |" for r in df.itertuples(index=False)
+    )
+    return head + body
+
+
+open(f"{OUT}/results.md", "w").write(df_to_markdown(results_df))
+print("\n=== Quantitative results (test split) ===")
+print(results_df.to_string(index=False))
+
+# ---------- Training curves ----------
+COLORS = {
+    "SimpleRNN": "#7f7f7f",
+    "BiRNN": "#4c78a8",
+    "LSTM": "#e45756",
+    "GRU": "#54a24b",
+}
+fig, ax = plt.subplots(1, 4, figsize=(20, 4))
+for kind in KINDS:
+    h = histories[kind]
+    ep = range(1, len(h["train_loss"]) + 1)
+    ax[0].plot(ep, h["train_loss"], label=kind, color=COLORS[kind])
+    ax[1].plot(ep, h["val_loss"], label=kind, color=COLORS[kind])
+    ax[2].plot(ep, h["val_ppl"], label=kind, color=COLORS[kind])
+    ax[3].plot(ep, h["val_acc"], label=kind, color=COLORS[kind])
+for a_, title in zip(
+    ax,
+    [
+        "Training loss",
+        "Validation loss",
+        "Validation perplexity",
+        "Validation top-1 accuracy",
+    ],
+):
+    a_.set_title(title)
+    a_.set_xlabel("epoch")
+    a_.grid(alpha=0.3)
+    a_.legend()
+plt.tight_layout()
+plt.savefig(f"{OUT}/curves.png", dpi=130)
+plt.close()
+
+# ---------- Bar charts: perplexity, accuracy, time, size ----------
+fig, ax = plt.subplots(1, 4, figsize=(20, 4))
+bar_cols = [COLORS[k] for k in KINDS]
+panels = [
+    ("Test perplexity (lower is better)", "Test perplexity"),
+    ("Training time (s)", "Train time (s)"),
+    ("Parameters", "Parameters"),
+]
+for a_, (title, col) in zip(ax[:3], panels):
+    vals = results_df[col].values
+    a_.bar(KINDS, vals, color=bar_cols)
+    a_.set_title(title)
+    for i_, v in enumerate(vals):
+        a_.text(
+            i_,
+            v,
+            f"{v:,.0f}" if v > 1000 else f"{v:g}",
+            ha="center",
+            va="bottom",
+            fontsize=9,
+        )
+x_pos = np.arange(len(KINDS))
+w = 0.38
+ax[3].bar(x_pos - w / 2, results_df["Top-1 acc"], w, label="top-1", color="#4c78a8")
+ax[3].bar(x_pos + w / 2, results_df["Top-5 acc"], w, label="top-5", color="#f58518")
+ax[3].set_xticks(x_pos)
+ax[3].set_xticklabels(KINDS)
+ax[3].set_title("Next-word accuracy")
+ax[3].legend()
+plt.tight_layout()
+plt.savefig(f"{OUT}/comparison_bars.png", dpi=130)
+plt.close()
+
+# ---------- Ranking printed from the measured numbers ----------
+print("\n=== Ranking (from measured results) ===")
+print(
+    "Lowest test perplexity :",
+    " < ".join(results_df.sort_values("Test perplexity")["Model"]),
+)
+print(
+    "Highest top-1 accuracy :",
+    " > ".join(results_df.sort_values("Top-1 acc", ascending=False)["Model"]),
+)
+print(
+    "Fastest total training :",
+    " < ".join(results_df.sort_values("Train time (s)")["Model"]),
+)
+print(
+    "Smallest val-train gap :",
+    " < ".join(results_df.sort_values("Val-train gap")["Model"]),
+)
+best_ppl = results_df.sort_values("Test perplexity").iloc[0]
+print(
+    f"\nBest perplexity: {best_ppl['Model']} ({best_ppl['Test perplexity']}); "
+    f"random-guess perplexity for this vocabulary would be {V}."
+)
