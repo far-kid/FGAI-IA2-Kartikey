@@ -1,0 +1,5 @@
+Model,Parameters,Epochs run,Train time (s),Sec/epoch,Final train loss,Best val loss,Test loss,Test perplexity,Top-1 acc,Top-5 acc,Val-train gap
+SimpleRNN,796832,9,17.2,1.9,3.689,4.544,4.59,98.5,0.2099,0.4345,0.514
+BiRNN,1333664,6,12.3,2.1,3.42,4.676,4.697,109.6,0.1927,0.4155,0.422
+LSTM,871328,10,22.6,2.3,3.637,4.447,4.476,87.9,0.2252,0.4544,0.628
+GRU,846496,8,15.4,1.9,3.549,4.46,4.482,88.4,0.2214,0.4434,0.447

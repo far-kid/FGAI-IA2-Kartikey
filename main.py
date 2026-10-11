@@ -484,7 +484,13 @@ results_df.to_csv(f"{OUT}/results.csv", index=False)
 
 
 def df_to_markdown(df):
-    head = "| " + " | ".join(df.columns) + " |\n|" + "---|" * len(df.columns) + "\n"
+    head = (
+        "| "
+        + " | ".join(str(column) for column in df.columns)
+        + " |\n|"
+        + "---|" * len(df.columns)
+        + "\n"
+    )
     body = "\n".join(
         "| " + " | ".join(str(v) for v in r) + " |" for r in df.itertuples(index=False)
     )
