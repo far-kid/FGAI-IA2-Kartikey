@@ -185,3 +185,202 @@ for name, arr in parts.items():
 
 print("\nExample input  X:", " ".join(itos[i] for i in X[0].tolist()))
 print("Example target y:", itos[y[0].item()])
+
+# =====================================================================================
+# All four models share the SAME architecture skeleton:
+#     Embedding(V, E) -> recurrent layer(H) -> Dropout -> Linear(-> V logits)
+# Only the recurrent cell differs, so any performance difference comes from the cell type.
+#
+#   SimpleRNN : h_t = tanh(W_x x_t + W_h h_{t-1} + b)
+#   BiRNN     : two SimpleRNNs, one reads the window left->right, one right->left;
+#               their final hidden states are concatenated (output layer is 2H wide)
+#   LSTM      : input / forget / output gates + cell state
+#   GRU       : update / reset gates (fewer parameters than LSTM)
+#
+# The final hidden state(s) after reading the 20-word window summarise the context and are
+# used to predict the next word.  (BiRNN is valid here because the window contains only
+# words that are already known/generated; nothing from the future is used.)
+KINDS = ["SimpleRNN", "BiRNN", "LSTM", "GRU"]
+
+
+class RecurrentLM(nn.Module):
+    def __init__(self, kind, vocab_size, embed_dim, hidden_dim, dropout):
+        super().__init__()
+        self.kind = kind
+        self.bidirectional = kind == "BiRNN"
+        self.embedding = nn.Embedding(vocab_size, embed_dim)
+        if kind in ("SimpleRNN", "BiRNN"):
+            self.rnn = nn.RNN(
+                embed_dim,
+                hidden_dim,
+                batch_first=True,
+                nonlinearity="tanh",
+                bidirectional=self.bidirectional,
+            )
+        elif kind == "LSTM":
+            self.rnn = nn.LSTM(embed_dim, hidden_dim, batch_first=True)
+        elif kind == "GRU":
+            self.rnn = nn.GRU(embed_dim, hidden_dim, batch_first=True)
+        else:
+            raise ValueError(f"unknown model kind: {kind}")
+        self.dropout = nn.Dropout(dropout)
+        out_dim = hidden_dim * (2 if self.bidirectional else 1)
+        self.fc = nn.Linear(out_dim, vocab_size)
+
+    def forward(self, x):  # x: (batch, seq_len) of word indices
+        _, h = self.rnn(self.embedding(x))  # h: final hidden state(s)
+        if self.kind == "LSTM":
+            h = h[0]  # LSTM returns (h_n, c_n); keep h_n
+        if self.bidirectional:  # h: (2, batch, H) -> (batch, 2H)
+            feat = torch.cat([h[-2], h[-1]], dim=1)
+        else:  # h: (1, batch, H) -> (batch, H)
+            feat = h[-1]
+        return self.fc(self.dropout(feat))  # logits over the vocabulary
+
+
+def build_model(kind):
+    return RecurrentLM(kind, V, CFG["embed_dim"], CFG["hidden_dim"], CFG["dropout"]).to(
+        DEVICE
+    )
+
+
+def count_params(model):
+    return sum(p.numel() for p in model.parameters())
+
+
+@torch.no_grad()
+def evaluate(model, loader):
+    """Returns cross-entropy loss, perplexity (= exp(loss)), top-1 and top-5 next-word accuracy."""
+    model.eval()
+    total_loss, top1, top5, count = 0.0, 0, 0, 0
+    for xb, yb in loader:
+        xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+        logits = model(xb)
+        total_loss += F.cross_entropy(logits, yb, reduction="sum").item()
+        top1 += (logits.argmax(dim=1) == yb).sum().item()
+        top5 += (
+            (logits.topk(5, dim=1).indices == yb.unsqueeze(1)).any(dim=1).sum().item()
+        )
+        count += len(yb)
+    loss = total_loss / count
+    return {
+        "loss": loss,
+        "perplexity": math.exp(loss),
+        "top1": top1 / count,
+        "top5": top5 / count,
+    }
+
+
+def train_model(kind):
+    """Train one model with the shared configuration; returns (model, history, test_metrics, info)."""
+    set_seed(CFG["seed"])  # same initialisation seed for every model
+    model = build_model(kind)
+    n_params = count_params(model)
+    print(f"\n=== {kind} | parameters: {n_params:,} | device: {DEVICE} ===")
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=CFG["lr"])
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, factor=0.5, patience=1
+    )
+    history = {
+        "train_loss": [],
+        "val_loss": [],
+        "val_ppl": [],
+        "val_acc": [],
+        "epoch_time": [],
+    }
+    best_val, best_state, bad_epochs = float("inf"), None, 0
+
+    t_start = time.time()
+    for epoch in range(1, CFG["epochs"] + 1):
+        t_epoch = time.time()
+        model.train()
+        running, seen = 0.0, 0
+        for xb, yb in loaders["train"]:
+            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+            optimizer.zero_grad()
+            loss = F.cross_entropy(model(xb), yb)
+            loss.backward()
+            nn.utils.clip_grad_norm_(
+                model.parameters(), 1.0
+            )  # gradient clipping for all models
+            optimizer.step()
+            running += loss.item() * len(yb)
+            seen += len(yb)
+
+        val = evaluate(model, loaders["val"])
+        scheduler.step(val["loss"])
+        history["train_loss"].append(running / seen)
+        history["val_loss"].append(val["loss"])
+        history["val_ppl"].append(val["perplexity"])
+        history["val_acc"].append(val["top1"])
+        history["epoch_time"].append(time.time() - t_epoch)
+        print(
+            f"[{kind}] epoch {epoch:02d} | train loss {running / seen:.3f} | val loss {val['loss']:.3f} "
+            f"| val ppl {val['perplexity']:.1f} | val acc {val['top1']:.3f} | {history['epoch_time'][-1]:.1f}s"
+        )
+
+        if val["loss"] < best_val - 1e-4:  # keep the best-validation weights
+            best_val, bad_epochs = val["loss"], 0
+            best_state = {
+                k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+            }
+        else:
+            bad_epochs += 1
+            if bad_epochs >= CFG["patience"]:
+                print(f"[{kind}] early stopping at epoch {epoch}")
+                break
+    train_time = time.time() - t_start
+
+    model.load_state_dict(best_state)  # restore best weights before testing
+    test = evaluate(model, loaders["test"])
+    print(
+        f"[{kind}] TEST | loss {test['loss']:.3f} | perplexity {test['perplexity']:.1f} "
+        f"| top-1 {test['top1']:.3f} | top-5 {test['top5']:.3f} | train time {train_time:.1f}s"
+    )
+
+    info = {
+        "params": n_params,
+        "epochs_run": len(history["val_loss"]),
+        "train_time_s": train_time,
+        "best_val_loss": best_val,
+    }
+    return model, history, test, info
+
+
+# =====================================================================================
+# Training
+# Same data, split, shuffling, seed, optimiser, learning-rate schedule, gradient clipping,
+# dropout, early-stopping rule and number of epochs for every model.
+# NOTE: reported training time = wall-clock time of the whole training loop, including the
+#       per-epoch validation pass (same for all models, so the comparison stays fair).
+models, histories, test_results, run_info = {}, {}, {}, {}
+
+if __name__ == "__main__":
+    os.makedirs(f"{OUT}/models", exist_ok=True)
+    for kind in KINDS:
+        model, history, test, info = train_model(kind)
+        models[kind], histories[kind], test_results[kind], run_info[kind] = (
+            model,
+            history,
+            test,
+            info,
+        )
+        torch.save(
+            model.state_dict(), f"{OUT}/models/{kind}.pt"
+        )  # best-validation weights
+
+    # save everything so the analysis chunks (and the README) can use it
+    json.dump(
+        {"config": CFG, "histories": histories, "test": test_results, "info": run_info},
+        open(f"{OUT}/training_results.json", "w"),
+        indent=2,
+    )
+
+    print("\n === Summary of training ===")
+    for k in KINDS:
+        t, i = test_results[k], run_info[k]
+        print(
+            f"{k:10s} params={i['params']:>9,}  epochs={i['epochs_run']:>2}  time={i['train_time_s']:7.1f}s  "
+            f"test_loss={t['loss']:.3f}  ppl={t['perplexity']:7.1f}  top1={t['top1']:.3f}  top5={t['top5']:.3f}"
+        )
